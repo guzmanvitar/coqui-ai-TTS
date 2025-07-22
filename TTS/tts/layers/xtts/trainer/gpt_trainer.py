@@ -39,6 +39,8 @@ class GPTArgs(XttsArgs):
     xtts_checkpoint: str = ""
     gpt_checkpoint: str = ""  # if defined it will replace the gpt weights on xtts model
     vocoder: str = ""  # overide vocoder key on the config to avoid json write issues
+    use_self_reference: bool = False  # if True, use each clip as its own reference for better style retention
+    use_self_reference: bool = False  # if True, use each clip as its own reference for better style retention
 
 
 @dataclass

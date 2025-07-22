@@ -124,7 +124,11 @@ class XTTSDataset(torch.utils.data.Dataset):
             # if use masking do not use cond_len
             cond_len = torch.nan
         else:
-            ref_sample = (
+            # Check if we should use self-reference (each clip as its own reference)
+            if hasattr(self.config.model_args, "use_self_reference") and self.config.model_args.use_self_reference:
+                ref_sample = audiopath  # Use the same audio file as reference
+            else:
+                ref_sample = (
                 sample["reference_path"]
                 if "reference_path" in sample and sample["reference_path"] is not None
                 else audiopath
