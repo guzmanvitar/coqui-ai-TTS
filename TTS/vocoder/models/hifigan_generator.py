@@ -277,10 +277,11 @@ class HifiganGenerator(torch.nn.Module):
 
             z_sum = None
             for j in range(self.num_kernels):
+                res_out = self.resblocks[i * self.num_kernels + j](o)
                 if z_sum is None:
-                    z_sum = self.resblocks[i * self.num_kernels + j](o)
+                    z_sum = res_out
                 else:
-                    z_sum += self.resblocks[i * self.num_kernels + j](o)
+                    z_sum = z_sum + res_out
             o = z_sum / self.num_kernels
         o = F.leaky_relu(o)
         o = self.conv_post(o)

@@ -16,6 +16,8 @@ from TTS.tts.layers.tortoise.arch_utils import TorchMelSpectrogram
 from TTS.tts.layers.xtts.dvae import DiscreteVAE
 from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
 from TTS.tts.layers.xtts.trainer.dataset import XTTSDataset
+from TTS.tts.layers.xtts.slm_loss import SLMPerceptualLoss
+
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.tts.models.xtts import Xtts, XttsArgs
 from TTS.utils.generic_utils import is_pytorch_at_least_2_4
@@ -38,9 +40,15 @@ class GPTArgs(XttsArgs):
     dvae_checkpoint: str = ""
     xtts_checkpoint: str = ""
     gpt_checkpoint: str = ""  # if defined it will replace the gpt weights on xtts model
-    vocoder: str = ""  # overide vocoder key on the config to avoid json write issues
+    vocoder: str = ""  # override vocoder key on the config to avoid json write issues
     use_self_reference: bool = False  # if True, use each clip as its own reference for better style retention
-    use_self_reference: bool = False  # if True, use each clip as its own reference for better style retention
+
+    # Perceptual loss (SLM) hyperparameters
+    slm_loss_recon_weight: float = 1.0
+    slm_loss_contrast_weight: float = 0.1
+    slm_temperature: float = 0.07
+    slm_output_layer: int = 12
+    slm_backprop_to_gpt: bool = True  # if True, let SLM loss backpropagate through GPT latents
 
 
 @dataclass
@@ -194,10 +202,24 @@ class GPTTrainer(BaseTTS):
                 "You need to specify config.model_args.dvae_checkpoint path to be able to train the GPT decoder!!"
             )
 
+        # Perceptual loss on waveforms using a self-supervised speech model (WavLM)
+        self.slm_perceptual_loss = SLMPerceptualLoss(
+            gt_sample_rate=config.audio.sample_rate,
+            gen_sample_rate=self.xtts.hifigan_decoder.output_sample_rate,
+            output_layer=self.args.slm_output_layer,
+            temperature=self.args.slm_temperature,
+            device="cpu",
+        )
+
         # Mel spectrogram extractor for DVAE
         self.torch_mel_spectrogram_dvae = TorchMelSpectrogram(
             mel_norm_file=self.args.mel_norm_file, sampling_rate=config.audio.dvae_sample_rate
         )
+
+        # Autograd anomaly detection disabled for production training (saves memory and improves speed)
+        # Uncomment the following lines only for debugging gradient issues:
+        # torch.autograd.set_detect_anomaly(True)
+        # logger.info("Enabled torch.autograd anomaly detection for GPTTrainer.")
 
     def forward(self, text_inputs, text_lengths, audio_codes, wav_lengths, cond_mels, cond_idxs, cond_lens):
         """
@@ -259,23 +281,46 @@ class GPTTrainer(BaseTTS):
 
     @torch.no_grad()  # torch no grad to avoid gradients from the pre-processing and DVAE codes extraction
     def format_batch_on_device(self, batch):
-        """Compute spectrograms on the device."""
+        """Compute spectrograms and auxiliary features on the device.
+
+        This prepares:
+        - text_inputs / lengths
+        - conditioning mels for GPT
+        - speaker embeddings for HiFiGAN
+        - DVAE audio codes
+        and keeps the raw waveform for perceptual loss.
+        """
+
         batch["text_lengths"] = batch["text_lengths"]
         batch["wav_lengths"] = batch["wav_lengths"]
         batch["text_inputs"] = batch["padded_text"]
         batch["cond_idxs"] = batch["cond_idxs"]
-        # compute conditioning mel specs
-        # transform waves from torch.Size([B, num_cond_samples, 1, T] to torch.Size([B * num_cond_samples, 1, T] because if is faster than iterate the tensor
+
+        # Compute conditioning mel specs
+        # Transform waves from torch.Size([B, num_cond_samples, 1, T]) to
+        # torch.Size([B * num_cond_samples, 1, T]) because it is faster than iterating.
         B, num_cond_samples, C, T = batch["conditioning"].size()
         conditioning_reshaped = batch["conditioning"].view(B * num_cond_samples, C, T)
         paired_conditioning_mel = self.torch_mel_spectrogram_style_encoder(conditioning_reshaped)
-        # transform torch.Size([B * num_cond_samples, n_mel, T_mel]) in torch.Size([B, num_cond_samples, n_mel, T_mel])
-        n_mel = self.torch_mel_spectrogram_style_encoder.n_mel_channels  # paired_conditioning_mel.size(1)
+        # Transform torch.Size([B * num_cond_samples, n_mel, T_mel]) into
+        # torch.Size([B, num_cond_samples, n_mel, T_mel])
+        n_mel = self.torch_mel_spectrogram_style_encoder.n_mel_channels
         T_mel = paired_conditioning_mel.size(2)
         paired_conditioning_mel = paired_conditioning_mel.view(B, num_cond_samples, n_mel, T_mel)
-        # get the conditioning embeddings
         batch["cond_mels"] = paired_conditioning_mel
-        # compute codes using DVAE
+
+        # Compute speaker embeddings from conditioning waveforms
+        conditioning_audio = conditioning_reshaped.squeeze(1)  # (B * num_cond_samples, T)
+        speaker_embedding = self.xtts.get_speaker_embedding(
+            conditioning_audio,
+            sr=self.config.audio.sample_rate,
+        )  # (B * num_cond_samples, 512, 1)
+        speaker_embedding = speaker_embedding.view(B, num_cond_samples, speaker_embedding.size(1), speaker_embedding.size(2))
+        # Average over potentially multiple conditioning samples per item
+        speaker_embedding = speaker_embedding.mean(dim=1)
+        batch["speaker_embedding"] = speaker_embedding
+
+        # Compute codes using DVAE
         if self.config.audio.sample_rate != self.config.audio.dvae_sample_rate:
             dvae_wav = torchaudio.functional.resample(
                 batch["wav"],
@@ -292,9 +337,8 @@ class GPTTrainer(BaseTTS):
         codes = self.dvae.get_codebook_indices(dvae_mel_spec)
 
         batch["audio_codes"] = codes
-        # delete useless batch tensors
+        # delete useless batch tensors (keep `wav` for perceptual loss)
         del batch["padded_text"]
-        del batch["wav"]
         del batch["conditioning"]
         return batch
 
@@ -307,13 +351,54 @@ class GPTTrainer(BaseTTS):
         wav_lengths = batch["wav_lengths"]
         cond_idxs = batch["cond_idxs"]
         cond_lens = batch["cond_lens"]
+        speaker_embedding = batch["speaker_embedding"]
+        wav_gt = batch["wav"]
 
+        # Standard GPT cross-entropy losses
         loss_text, loss_mel, _ = self.forward(
-            text_inputs, text_lengths, audio_codes, wav_lengths, cond_mels, cond_idxs, cond_lens
+            text_inputs,
+            text_lengths,
+            audio_codes,
+            wav_lengths,
+            cond_mels,
+            cond_idxs,
+            cond_lens,
         )
         loss_dict["loss_text_ce"] = loss_text * self.args.gpt_loss_text_ce_weight
         loss_dict["loss_mel_ce"] = loss_mel * self.args.gpt_loss_mel_ce_weight
-        loss_dict["loss"] = loss_dict["loss_text_ce"] + loss_dict["loss_mel_ce"]
+
+        # Get GPT latents for HiFiGAN (no CE loss here, just latents)
+        gpt_latents = self.xtts.gpt(
+            text_inputs,
+            text_lengths,
+            audio_codes,
+            wav_lengths,
+            cond_mels=cond_mels,
+            cond_idxs=cond_idxs,
+            cond_lens=cond_lens,
+            return_latent=True,
+        )
+
+        # Generate waveforms with HiFiGAN.
+        # `slm_backprop_to_gpt` controls whether SLM gradients flow back through GPT
+        # latents or only update the decoder. When False we detach latents to keep the
+        # SLM path vocoder-only (current stable behavior).
+        if self.args.slm_backprop_to_gpt:
+            wav_gen = self.xtts.hifigan_decoder(gpt_latents, g=speaker_embedding)
+        else:
+            wav_gen = self.xtts.hifigan_decoder(gpt_latents.detach(), g=speaker_embedding)
+
+        # Dual perceptual loss on raw audio (SLM)
+        loss_recon_slm, loss_contrast_slm = self.slm_perceptual_loss(wav_gen, wav_gt)
+        loss_dict["loss_slm_recon"] = loss_recon_slm * self.args.slm_loss_recon_weight
+        loss_dict["loss_slm_contrast"] = loss_contrast_slm * self.args.slm_loss_contrast_weight
+
+        loss_dict["loss"] = (
+            loss_dict["loss_text_ce"]
+            + loss_dict["loss_mel_ce"]
+            + loss_dict["loss_slm_recon"]
+            + loss_dict["loss_slm_contrast"]
+        )
         return {"model_outputs": None}, loss_dict
 
     def eval_step(self, batch, criterion):

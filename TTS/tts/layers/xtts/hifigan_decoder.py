@@ -69,31 +69,42 @@ class HifiDecoder(torch.nn.Module):
         return next(self.parameters()).device
 
     def forward(self, latents, g=None):
-        """
+        """Decode GPT latents into waveform with HiFi-GAN.
+
         Args:
-            x (Tensor): feature input tensor (GPT latent).
-            g (Tensor): global conditioning input tensor.
+            latents (Tensor): GPT latent tensor of shape [B, T, C] or [B, C, T].
+            g (Tensor): global conditioning input tensor (speaker embedding).
 
         Returns:
-            Tensor: output waveform.
-
-        Shapes:
-            x: [B, C, T]
-            Tensor: [B, 1, T]
+            Tensor: output waveform of shape [B, 1, T_wav].
         """
 
+        # Ensure we have channel-first time-last layout for HiFi-GAN: [B, C, T]
+        if latents.dim() != 3:
+            raise ValueError(f"Expected 3D latents, got shape {latents.shape}.")
+
+        if latents.shape[1] < latents.shape[2]:
+            # Common case in XTTS: latents are [B, T, C]
+            x = latents.transpose(1, 2).contiguous()
+        else:
+            # Already [B, C, T]
+            x = latents.contiguous()
+
+        # First: upsample along the sequence axis to match HiFi-GAN hop length
         z = torch.nn.functional.interpolate(
-            latents.transpose(1, 2),
+            x,
             scale_factor=[self.ar_mel_length_compression / self.output_hop_length],
             mode="linear",
-        ).squeeze(1)
-        # upsample to the right sr
+        )
+
+        # Then: upsample to the target sample rate, if needed
         if self.output_sample_rate != self.input_sample_rate:
             z = torch.nn.functional.interpolate(
                 z,
                 scale_factor=[self.output_sample_rate / self.input_sample_rate],
                 mode="linear",
-            ).squeeze(0)
+            )
+
         o = self.waveform_decoder(z, g=g)
         return o
 

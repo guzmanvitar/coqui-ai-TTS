@@ -161,7 +161,7 @@ class ResNetSpeakerEncoder(BaseEncoder):
         Shapes:
             - x: :math:`(N, 1, T_{in})` or :math:`(N, D_{spec}, T_{in})`
         """
-        x.squeeze_(1)
+        x = x.squeeze(1)
         # if you torch spec compute it otherwise use the mel spec computed by the AP
         if self.use_torch_spec:
             x = self.torch_spec(x)

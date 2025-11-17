@@ -547,7 +547,8 @@ class TransformerEncoder(nn.Module):
 
         x_conv = self.pos_conv(x.transpose(1, 2))
         x_conv = x_conv.transpose(1, 2)
-        x += x_conv
+        # Avoid in-place addition on x to keep autograd versioning safe when x is a view.
+        x = x + x_conv
 
         if not self.layer_norm_first:
             x = self.layer_norm(x)
