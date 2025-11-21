@@ -337,6 +337,9 @@ class GPTTrainer(BaseTTS):
         codes = self.dvae.get_codebook_indices(dvae_mel_spec)
 
         batch["audio_codes"] = codes
+        # Store conditioning audio for speaker embedding computation in train_step
+        # (we need it with gradients for perceptual loss backprop)
+        batch["conditioning_audio"] = conditioning_reshaped
         # delete useless batch tensors (keep `wav` for perceptual loss)
         del batch["padded_text"]
         del batch["conditioning"]
@@ -351,8 +354,46 @@ class GPTTrainer(BaseTTS):
         wav_lengths = batch["wav_lengths"]
         cond_idxs = batch["cond_idxs"]
         cond_lens = batch["cond_lens"]
-        speaker_embedding = batch["speaker_embedding"]
         wav_gt = batch["wav"]
+
+        # Compute speaker embeddings with gradients for training, without for eval.
+        # During training: recompute WITH gradients for perceptual loss backprop.
+        # We can't use batch["speaker_embedding"] because it was computed under
+        # @torch.no_grad() in format_batch_on_device, which blocks gradient flow
+        # through the HiFiGAN decoder's speaker conditioning path.
+        # During eval: use pre-computed embeddings (no gradients needed).
+        # NOTE: We check if GPT is in training mode because the whole model is set to eval()
+        # in on_train_epoch_start, and only GPT is set back to train().
+        if self.xtts.gpt.training:
+            conditioning_audio = batch["conditioning_audio"]  # (B * num_cond_samples, 1, T)
+            B = text_inputs.size(0)
+            B_times_num_cond = conditioning_audio.size(0)
+            num_cond_samples = B_times_num_cond // B
+
+            # Call speaker encoder directly (bypass @torch.inference_mode() decorator)
+            conditioning_audio_16k = torchaudio.functional.resample(
+                conditioning_audio.squeeze(1),
+                self.config.audio.sample_rate,
+                16000
+            )
+            speaker_embedding = self.xtts.hifigan_decoder.speaker_encoder.forward(
+                conditioning_audio_16k,
+                l2_norm=True
+            ).unsqueeze(-1)  # (B * num_cond_samples, 512, 1)
+
+            # Reshape and average over conditioning samples
+            speaker_embedding = speaker_embedding.view(B, num_cond_samples, speaker_embedding.size(1), speaker_embedding.size(2))
+            speaker_embedding = speaker_embedding.mean(dim=1)  # (B, 512, 1)
+
+            # CRITICAL: The speaker encoder is frozen (requires_grad=False), so its output
+            # also has requires_grad=False. We need to detach it and make it a leaf variable
+            # with requires_grad=True so gradients can flow through the HiFiGAN decoder's
+            # speaker conditioning path (for perceptual loss), without trying to backprop
+            # through the frozen speaker encoder.
+            speaker_embedding = speaker_embedding.detach().requires_grad_(True)
+        else:
+            # During evaluation, use pre-computed embeddings (no gradients)
+            speaker_embedding = batch["speaker_embedding"]
 
         # Standard GPT cross-entropy losses
         loss_text, loss_mel, _ = self.forward(

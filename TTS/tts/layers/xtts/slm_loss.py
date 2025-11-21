@@ -135,7 +135,13 @@ class SLMPerceptualLoss(nn.Module):
         # Similarity matrix: (B, B), positives on the diagonal
         logits = gen_norm @ gt_norm.t() / self.temperature
         targets = torch.arange(logits.size(0), device=logits.device)
-        loss_contrast = F.cross_entropy(logits, targets)
+
+        # Contrastive loss requires batch size > 1
+        # If batch size is 1, return zero loss (no negative pairs to contrast against)
+        if logits.size(0) == 1:
+            loss_contrast = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        else:
+            loss_contrast = F.cross_entropy(logits, targets)
 
         return loss_recon, loss_contrast
 
